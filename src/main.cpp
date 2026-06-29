@@ -1,28 +1,92 @@
 #include <Arduino.h>
 
-#define LED_GPIO_RED 4
+#define LED1_PIN 2
+#define LED2_PIN 4
+#define EXT_BTN_PIN 5
+#define BOOT_BTN_PIN 0
 
-#define LED_GPIO_BLUE 16
+#define DEBOUNCE_MS 50
+
+#define DELAY_SLOW 800
+#define DELAY_FAST 150
+
+int extLastRaw = LOW;
+int bootLastRaw = HIGH;
+
+unsigned long extChangeAt = 0;
+unsigned long bootChangeAt = 0;
+
+int extStable = LOW;
+int bootStable = HIGH;
+
+int blinkDelay = DELAY_SLOW;
+
+void checkButtons()
+{
+  unsigned long now = millis();
+
+  // BUTTON (INPUT_PULLDOWN: HIGH)
+  int extRaw = digitalRead(EXT_BTN_PIN);
+  if (extRaw != extLastRaw)
+    extChangeAt = now;
+
+  if (now - extChangeAt > DEBOUNCE_MS && extRaw != extStable)
+  {
+    extStable = extRaw;
+    if (extStable == HIGH)
+    {
+      blinkDelay = DELAY_FAST;
+      Serial.println("EXT BTN pressed -> FAST blink");
+    }
+  }
+  extLastRaw = extRaw;
+
+  //  BOOT (INPUT_PULLUP: LOW)
+  int bootRaw = digitalRead(BOOT_BTN_PIN);
+  if (bootRaw != bootLastRaw)
+    bootChangeAt = now;
+
+  if (now - bootChangeAt > DEBOUNCE_MS && bootRaw != bootStable)
+  {
+    bootStable = bootRaw;
+    if (bootStable == LOW)
+    {
+      blinkDelay = DELAY_SLOW;
+      Serial.println("BOOT BTN pressed -> SLOW blink");
+    }
+  }
+  bootLastRaw = bootRaw;
+}
 
 void setup()
 {
-  // put your setup code here, to run once:
+  Serial.begin(115200);
+  delay(500);
 
-  pinMode(LED_GPIO_RED, OUTPUT);
-  pinMode(LED_GPIO_BLUE, OUTPUT);
+  pinMode(LED1_PIN, OUTPUT);
+  pinMode(LED2_PIN, OUTPUT);
+  pinMode(EXT_BTN_PIN, INPUT_PULLDOWN);
+  pinMode(BOOT_BTN_PIN, INPUT_PULLUP);
+
+  Serial.println("Ready. EXT=fast blink, BOOT=slow blink");
 }
 
 void loop()
 {
-  // put your main code here, to run repeatedly:
+  // Turn on LEDs
+  digitalWrite(LED1_PIN, HIGH);
+  digitalWrite(LED2_PIN, HIGH);
 
-  digitalWrite(LED_GPIO_RED, HIGH);
-  delay(90);
-  digitalWrite(LED_GPIO_RED, LOW);
-  delay(30);
+  // During the delay, check buttons every 1 ms
+  unsigned long start = millis();
+  while (millis() - start < (unsigned long)blinkDelay)
+    checkButtons();
 
-  digitalWrite(LED_GPIO_BLUE, HIGH);
-  delay(90);
-  digitalWrite(LED_GPIO_BLUE, LOW);
-  delay(30);
+  // Turn off LEDs
+  digitalWrite(LED1_PIN, LOW);
+  digitalWrite(LED2_PIN, LOW);
+
+  start = millis();
+  while (millis() - start < (unsigned long)blinkDelay)
+    checkButtons();
 }
