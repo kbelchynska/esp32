@@ -1,69 +1,96 @@
 #include <Arduino.h>
 
+#define LDR_PIN 4
+#define LED_PIN 7
 #define BAUDRATE 115200
+#define WINDOW_SIZE 8
 
-constexpr int8_t PIN_BTN = 4;
-constexpr int8_t PIN_RAW_OUT = 16;
-constexpr int8_t PIN_DEBOUNCE_OUT = 17;
-constexpr int32_t DEBOUNCE_MS = 30;
-
-volatile uint32_t rawCount = 0;
-uint32_t debCount = 0;
-
-uint32_t lastChangeMs = 0;
-
-int lastReading = HIGH, lastStable = HIGH;
-
-#define BUTTON_LEFT 15
-#define BUTTON_RIGHT 3
-
-int16_t counter_left = 0;
-int16_t counter_right = 0;
-
-void IRAM_ATTR onEdge()
-{
-  rawCount++;
-  Serial.println("\nLEFT Button Pressed! Count: " + String(rawCount));
-}
+int readings[WINDOW_SIZE];
+int idx = 0, sum = 0;
+int threshold = 1800;
+int hysteresis = 400;
+bool ledOn = false;
+const int CH = 0, FREQ = 5000, RES = 8;
 
 void setup()
 {
-  // put your setup code here, to run once:
   Serial.begin(BAUDRATE);
-  pinMode(PIN_BTN, INPUT_PULLDOWN);
-  pinMode(LED_BUILTIN, OUTPUT);
-  pinMode(PIN_RAW_OUT, OUTPUT);
-  pinMode(PIN_DEBOUNCE_OUT, OUTPUT);
-  attachInterrupt(digitalPinToInterrupt(PIN_BTN), onEdge, CHANGE);
-  Serial.printf("Logic analyzer demo: raw vs debounced \n");
+  // pinMode(LED_PIN, OUTPUT);
+  ledcSetup(CH, FREQ, RES);
+  ledcAttachPin(LED_PIN, CH);
+  // delay(300);
+  Serial.println("ADC start ...");
+
+  for (int i = 0; i < WINDOW_SIZE; i++)
+  {
+    readings[i] = analogRead(LDR_PIN);
+    sum += readings[i];
+  }
+  // int vMin = 4095, vMax = 0;
+  // Serial.println("The calibration for 5s: will close / will open the sensor!");
+
+  // unsigned long t0 = millis();
+  // while (millis() - t0 < 5000) {
+  //   int v = analogRead(LDR_PIN);
+  //   if (v < vMin) vMin = v;
+  //   if (v > vMax) vMax = v;
+  //   delay(10);
+  // }
+
+  // threshold = (vMin + vMax) / 2;
+  // Serial.print("vMin = "); Serial.print(vMin);
+  // Serial.print("\tvMax = "); Serial.print(vMax);
+  // Serial.print("\tThreshold = "); Serial.println(threshold);
 }
 
 void loop()
 {
-  // put your main code here, to run repeatedly:
-  int reading = digitalRead(PIN_BTN);
 
-  digitalWrite(PIN_RAW_OUT, reading);
+  sum = sum - readings[idx];
+  // 12 bits 0 - 4095 (4096)
+  // 8 bits 0-255 (256)
+  int adc = analogRead(LDR_PIN);
+  readings[idx] = adc;
+  sum += adc;
+  idx = (idx + 1) % WINDOW_SIZE;
 
-  if (reading != lastReading)
+  int avg = sum / WINDOW_SIZE;
+  // div on 4095, max = 4095 (from 0)
+  float volts = adc / 4095.0 * 3.3;
+
+  if (!ledOn && avg < threshold - hysteresis)
+    ledOn = true;
+  if (ledOn && avg > threshold + hysteresis)
+    ledOn = false;
+
+  // 2. Яскравість рахуємо тільки коли увімкнено
+  int bright = 0;
+  if (ledOn)
   {
-    lastChangeMs = millis();
-    lastReading = reading;
+    // верхня межа мапінгу = поріг вимкнення,
+    // бо вище цього avg ledOn вже стане false
+    bright = map(avg, 0, threshold + hysteresis, 255, 0);
+    bright = constrain(bright, 0, 255);
   }
 
-  if (millis() - lastChangeMs >= DEBOUNCE_MS)
-  {
-    if (reading != lastStable)
-    {
-      lastStable = reading;
-      digitalWrite(PIN_DEBOUNCE_OUT, lastStable);
-      digitalWrite(LED_BUILTIN, lastStable == LOW);
+  ledcWrite(CH, bright);
 
-      if (lastStable == LOW)
-      {
-        debCount++;
-        Serial.printf("RAW=%lu DEBOUNCED=%lu\n", rawCount, debCount);
-      }
-    }
-  }
+  // if (adc < threshold) {
+  //   digitalWrite(LED_PIN, HIGH);
+  // } else {
+  //   digitalWrite(LED_PIN, LOW);
+  // }
+  // digitalWrite(LED_PIN, ledOn ? HIGH : LOW);
+
+  Serial.print("ADC = ");
+  Serial.print(adc);
+  Serial.print("\tV:");
+  Serial.print(volts, 2);
+  Serial.print("\tAVG:");
+  Serial.print(avg);
+  Serial.print("\tPWM:");
+  Serial.println(bright);
+  // Serial.print("\tLED:");
+  // Serial.println(ledOn);
+  delay(50);
 }
