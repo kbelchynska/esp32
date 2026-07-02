@@ -1,92 +1,69 @@
 #include <Arduino.h>
 
-#define LED1_PIN 2
-#define LED2_PIN 4
-#define EXT_BTN_PIN 5
-#define BOOT_BTN_PIN 0
+#define BAUDRATE 115200
 
-#define DEBOUNCE_MS 50
+constexpr int8_t PIN_BTN = 4;
+constexpr int8_t PIN_RAW_OUT = 16;
+constexpr int8_t PIN_DEBOUNCE_OUT = 17;
+constexpr int32_t DEBOUNCE_MS = 30;
 
-#define DELAY_SLOW 800
-#define DELAY_FAST 150
+volatile uint32_t rawCount = 0;
+uint32_t debCount = 0;
 
-int extLastRaw = LOW;
-int bootLastRaw = HIGH;
+uint32_t lastChangeMs = 0;
 
-unsigned long extChangeAt = 0;
-unsigned long bootChangeAt = 0;
+int lastReading = HIGH, lastStable = HIGH;
 
-int extStable = LOW;
-int bootStable = HIGH;
+#define BUTTON_LEFT 15
+#define BUTTON_RIGHT 3
 
-int blinkDelay = DELAY_SLOW;
+int16_t counter_left = 0;
+int16_t counter_right = 0;
 
-void checkButtons()
+void IRAM_ATTR onEdge()
 {
-  unsigned long now = millis();
-
-  // BUTTON (INPUT_PULLDOWN: HIGH)
-  int extRaw = digitalRead(EXT_BTN_PIN);
-  if (extRaw != extLastRaw)
-    extChangeAt = now;
-
-  if (now - extChangeAt > DEBOUNCE_MS && extRaw != extStable)
-  {
-    extStable = extRaw;
-    if (extStable == HIGH)
-    {
-      blinkDelay = DELAY_FAST;
-      Serial.println("EXT BTN pressed -> FAST blink");
-    }
-  }
-  extLastRaw = extRaw;
-
-  //  BOOT (INPUT_PULLUP: LOW)
-  int bootRaw = digitalRead(BOOT_BTN_PIN);
-  if (bootRaw != bootLastRaw)
-    bootChangeAt = now;
-
-  if (now - bootChangeAt > DEBOUNCE_MS && bootRaw != bootStable)
-  {
-    bootStable = bootRaw;
-    if (bootStable == LOW)
-    {
-      blinkDelay = DELAY_SLOW;
-      Serial.println("BOOT BTN pressed -> SLOW blink");
-    }
-  }
-  bootLastRaw = bootRaw;
+  rawCount++;
+  Serial.println("\nLEFT Button Pressed! Count: " + String(rawCount));
 }
 
 void setup()
 {
-  Serial.begin(115200);
-  delay(500);
-
-  pinMode(LED1_PIN, OUTPUT);
-  pinMode(LED2_PIN, OUTPUT);
-  pinMode(EXT_BTN_PIN, INPUT_PULLDOWN);
-  pinMode(BOOT_BTN_PIN, INPUT_PULLUP);
-
-  Serial.println("Ready. EXT=fast blink, BOOT=slow blink");
+  // put your setup code here, to run once:
+  Serial.begin(BAUDRATE);
+  pinMode(PIN_BTN, INPUT_PULLDOWN);
+  pinMode(LED_BUILTIN, OUTPUT);
+  pinMode(PIN_RAW_OUT, OUTPUT);
+  pinMode(PIN_DEBOUNCE_OUT, OUTPUT);
+  attachInterrupt(digitalPinToInterrupt(PIN_BTN), onEdge, CHANGE);
+  Serial.printf("Logic analyzer demo: raw vs debounced \n");
 }
 
 void loop()
 {
-  // Turn on LEDs
-  digitalWrite(LED1_PIN, HIGH);
-  digitalWrite(LED2_PIN, HIGH);
+  // put your main code here, to run repeatedly:
+  int reading = digitalRead(PIN_BTN);
 
-  // During the delay, check buttons every 1 ms
-  unsigned long start = millis();
-  while (millis() - start < (unsigned long)blinkDelay)
-    checkButtons();
+  digitalWrite(PIN_RAW_OUT, reading);
 
-  // Turn off LEDs
-  digitalWrite(LED1_PIN, LOW);
-  digitalWrite(LED2_PIN, LOW);
+  if (reading != lastReading)
+  {
+    lastChangeMs = millis();
+    lastReading = reading;
+  }
 
-  start = millis();
-  while (millis() - start < (unsigned long)blinkDelay)
-    checkButtons();
+  if (millis() - lastChangeMs >= DEBOUNCE_MS)
+  {
+    if (reading != lastStable)
+    {
+      lastStable = reading;
+      digitalWrite(PIN_DEBOUNCE_OUT, lastStable);
+      digitalWrite(LED_BUILTIN, lastStable == LOW);
+
+      if (lastStable == LOW)
+      {
+        debCount++;
+        Serial.printf("RAW=%lu DEBOUNCED=%lu\n", rawCount, debCount);
+      }
+    }
+  }
 }
