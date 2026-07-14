@@ -1,96 +1,140 @@
 #include <Arduino.h>
 
-#define LDR_PIN 4
-#define LED_PIN 7
-#define BAUDRATE 115200
-#define WINDOW_SIZE 8
-
-int readings[WINDOW_SIZE];
-int idx = 0, sum = 0;
-int threshold = 1800;
-int hysteresis = 400;
-bool ledOn = false;
-const int CH = 0, FREQ = 5000, RES = 8;
-
-void setup()
+// Configuration (constexpr — compile-time constants)
+namespace Cfg
 {
-  Serial.begin(BAUDRATE);
-  // pinMode(LED_PIN, OUTPUT);
-  ledcSetup(CH, FREQ, RES);
-  ledcAttachPin(LED_PIN, CH);
-  // delay(300);
-  Serial.println("ADC start ...");
-
-  for (int i = 0; i < WINDOW_SIZE; i++)
-  {
-    readings[i] = analogRead(LDR_PIN);
-    sum += readings[i];
-  }
-  // int vMin = 4095, vMax = 0;
-  // Serial.println("The calibration for 5s: will close / will open the sensor!");
-
-  // unsigned long t0 = millis();
-  // while (millis() - t0 < 5000) {
-  //   int v = analogRead(LDR_PIN);
-  //   if (v < vMin) vMin = v;
-  //   if (v > vMax) vMax = v;
-  //   delay(10);
-  // }
-
-  // threshold = (vMin + vMax) / 2;
-  // Serial.print("vMin = "); Serial.print(vMin);
-  // Serial.print("\tvMax = "); Serial.print(vMax);
-  // Serial.print("\tThreshold = "); Serial.println(threshold);
+  constexpr uint8_t LED_PIN = 2;
+  constexpr uint8_t BTN_PIN = 0;          // BOOT button, INPUT_PULLUP
+  constexpr uint32_t BLINK_HALF_MS = 500; // half-period: on=500ms, off=500ms
+  constexpr uint32_t BAUD_RATE = 115200;
 }
 
-void loop()
+// Strongly-typed enums
+enum class LedState
 {
+  Off = LOW,
+  On = HIGH
+};
+enum class LedMode
+{
+  Blinking,
+  AlwaysOn,
+  AlwaysOff
+};
 
-  sum = sum - readings[idx];
-  // 12 bits 0 - 4095 (4096)
-  // 8 bits 0-255 (256)
-  int adc = analogRead(LDR_PIN);
-  readings[idx] = adc;
-  sum += adc;
-  idx = (idx + 1) % WINDOW_SIZE;
+// Led encapsulates pin + state, no dynamic memory
+class Led
+{
+public:
+  // static const: additional setting, not a compile-time expression
+  static const uint8_t BLINKS_ON_PRESS;
 
-  int avg = sum / WINDOW_SIZE;
-  // div on 4095, max = 4095 (from 0)
-  float volts = adc / 4095.0 * 3.3;
-
-  if (!ledOn && avg < threshold - hysteresis)
-    ledOn = true;
-  if (ledOn && avg > threshold + hysteresis)
-    ledOn = false;
-
-  // 2. Яскравість рахуємо тільки коли увімкнено
-  int bright = 0;
-  if (ledOn)
+  void init()
   {
-    // верхня межа мапінгу = поріг вимкнення,
-    // бо вище цього avg ledOn вже стане false
-    bright = map(avg, 0, threshold + hysteresis, 255, 0);
-    bright = constrain(bright, 0, 255);
+    pinMode(Cfg::LED_PIN, OUTPUT);
+    set(LedState::Off);
   }
 
-  ledcWrite(CH, bright);
+  void set(LedState s)
+  {
+    _state = s;
+    digitalWrite(Cfg::LED_PIN, static_cast<uint8_t>(s));
+  }
 
-  // if (adc < threshold) {
-  //   digitalWrite(LED_PIN, HIGH);
-  // } else {
-  //   digitalWrite(LED_PIN, LOW);
-  // }
-  // digitalWrite(LED_PIN, ledOn ? HIGH : LOW);
+  void setMode(LedMode m)
+  {
+    _mode = m;
+    _lastToggle = millis();
+    if (m == LedMode::AlwaysOn)
+      set(LedState::On);
+    if (m == LedMode::AlwaysOff)
+      set(LedState::Off);
+  }
 
-  Serial.print("ADC = ");
-  Serial.print(adc);
-  Serial.print("\tV:");
-  Serial.print(volts, 2);
-  Serial.print("\tAVG:");
-  Serial.print(avg);
-  Serial.print("\tPWM:");
-  Serial.println(bright);
-  // Serial.print("\tLED:");
-  // Serial.println(ledOn);
-  delay(50);
+  LedMode getMode() const { return _mode; }
+
+  // called every loop() iteration — non-blocking
+  void update()
+  {
+    if (_mode != LedMode::Blinking)
+      return;
+    const uint32_t now = millis();
+    if (now - _lastToggle >= Cfg::BLINK_HALF_MS)
+    {
+      _lastToggle = now;
+      set(_state == LedState::On ? LedState::Off : LedState::On);
+    }
+  }
+
+private:
+  LedState _state = LedState::Off;
+  LedMode _mode = LedMode::Blinking;
+  uint32_t _lastToggle = 0;
+};
+
+// out-of-class definition required for static const (non-constexpr)
+const uint8_t Led::BLINKS_ON_PRESS = 3;
+
+volatile bool buttonPressed = false;
+
+void IRAM_ATTR onBtn()
+{
+  buttonPressed = true;
+}
+
+// Superloop timing
+namespace Perf
+{
+  static uint32_t count = 0;
+  static uint32_t totalUs = 0;
+  constexpr uint32_t WINDOW = 1000;
+}
+
+//  Single global instance
+Led led;
+
+//  Setup
+void setup()
+{
+  Serial.begin(Cfg::BAUD_RATE);
+  led.init();
+  pinMode(Cfg::BTN_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(Cfg::BTN_PIN), onBtn, FALLING);
+  Serial.println("Ready | BOOT cycles: Blinking -> AlwaysOn -> AlwaysOff");
+}
+
+//  Superloop
+void loop()
+{
+  const uint32_t t0 = micros();
+
+  // handle button: логіка перемикання — поза ISR
+  if (buttonPressed)
+  {
+    buttonPressed = false;
+    switch (led.getMode())
+    {
+    case LedMode::Blinking:
+      led.setMode(LedMode::AlwaysOn);
+      break;
+    case LedMode::AlwaysOn:
+      led.setMode(LedMode::AlwaysOff);
+      break;
+    case LedMode::AlwaysOff:
+      led.setMode(LedMode::Blinking);
+      break;
+    }
+  }
+
+  led.update();
+
+  Perf::totalUs += micros() - t0;
+  if (++Perf::count >= Perf::WINDOW)
+  {
+    Serial.printf("[perf] avg %.2f us/iter over %lu iters\n",
+                  static_cast<float>(Perf::totalUs) / Perf::WINDOW,
+                  Perf::WINDOW);
+    Perf::count = 0;
+    Perf::totalUs = 0;
+  }
 }
