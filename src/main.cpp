@@ -1,18 +1,15 @@
 #include <Arduino.h>
 
 #define BUTTON_PIN 4
-#define DEBOUNCE_MS 50
+#define CHECK_DELAY_MS 30
 
-volatile uint32_t rawIsrCount = 0;
-volatile bool isrEvent = false;
+volatile bool eventPending = false;
 
 uint32_t validCounter = 0;
-uint32_t lastValidTime = 0;
 
-void IRAM_ATTR onButtonPress()
+void IRAM_ATTR onButtonEdge()
 {
-  rawIsrCount++;
-  isrEvent = true;
+  eventPending = true;
 }
 
 void setup()
@@ -20,28 +17,32 @@ void setup()
   Serial.begin(115200);
   delay(300);
   pinMode(BUTTON_PIN, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), onButtonPress, FALLING);
-  Serial.println("=== Task 2: Time-based debounce (50 ms) ===");
+  attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), onButtonEdge, FALLING);
+  Serial.println("=== Task 3: State-based debounce ===");
 }
 
 void loop()
 {
-  if (isrEvent)
+  if (eventPending)
   {
-    isrEvent = false;
-    uint32_t now = millis();
+    eventPending = false;
+    delay(CHECK_DELAY_MS);
 
-    if (now - lastValidTime >= DEBOUNCE_MS)
+    if (digitalRead(BUTTON_PIN) == LOW)
     {
+
       validCounter++;
-      lastValidTime = now;
-      Serial.printf("VALID press #%lu (raw ISR count=%lu), t=%lu ms\n",
-                    validCounter, rawIsrCount, now);
+      Serial.printf("PRESS accepted #%lu, t=%lu ms\n", validCounter, millis());
+
+      while (digitalRead(BUTTON_PIN) == LOW)
+      {
+        delay(5);
+      }
+      Serial.println("Released (без реакції)");
     }
     else
     {
-      Serial.printf("Ignored bounce, dt=%lu ms (raw ISR count=%lu)\n",
-                    now - lastValidTime, rawIsrCount);
+      Serial.println("Ignored: rebound/release, pin HIGH after delay");
     }
   }
 }
