@@ -1,48 +1,90 @@
 #include <Arduino.h>
 
 #define BUTTON_PIN 4
-#define CHECK_DELAY_MS 30
+#define POLL_INTERVAL_MS 10
+#define STABLE_COUNT_NEEDED 3
 
-volatile bool eventPending = false;
-
-uint32_t validCounter = 0;
-
-void IRAM_ATTR onButtonEdge()
+enum ButtonState
 {
-  eventPending = true;
-}
+  IDLE,
+  DEBOUNCE_LOW,
+  PRESSED,
+  DEBOUNCE_HIGH
+};
+
+ButtonState state = IDLE;
+uint32_t lastPollTime = 0;
+uint8_t stableCounter = 0;
+uint32_t validCounter = 0;
 
 void setup()
 {
   Serial.begin(115200);
   delay(300);
   pinMode(BUTTON_PIN, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), onButtonEdge, FALLING);
-  Serial.println("=== Task 3: State-based debounce ===");
+  Serial.println("=== Task 4: Polling state-machine debounce ===");
 }
 
 void loop()
 {
-  if (eventPending)
+  uint32_t now = millis();
+  if (now - lastPollTime < POLL_INTERVAL_MS)
+    return;
+  lastPollTime = now;
+
+  bool pinLow = (digitalRead(BUTTON_PIN) == LOW);
+
+  switch (state)
   {
-    eventPending = false;
-    delay(CHECK_DELAY_MS);
-
-    if (digitalRead(BUTTON_PIN) == LOW)
+  case IDLE:
+    if (pinLow)
     {
+      state = DEBOUNCE_LOW;
+      stableCounter = 1;
+    }
+    break;
 
-      validCounter++;
-      Serial.printf("PRESS accepted #%lu, t=%lu ms\n", validCounter, millis());
-
-      while (digitalRead(BUTTON_PIN) == LOW)
+  case DEBOUNCE_LOW:
+    if (pinLow)
+    {
+      stableCounter++;
+      if (stableCounter >= STABLE_COUNT_NEEDED)
       {
-        delay(5);
+        validCounter++;
+        Serial.printf("PRESS #%lu confirmed, t=%lu ms\n", validCounter, now);
+        state = PRESSED;
       }
-      Serial.println("Released (без реакції)");
     }
     else
     {
-      Serial.println("Ignored: rebound/release, pin HIGH after delay");
+      state = IDLE;
+      stableCounter = 0;
     }
+    break;
+
+  case PRESSED:
+    if (!pinLow)
+    {
+      state = DEBOUNCE_HIGH;
+      stableCounter = 1;
+    }
+    break;
+
+  case DEBOUNCE_HIGH:
+    if (!pinLow)
+    {
+      stableCounter++;
+      if (stableCounter >= STABLE_COUNT_NEEDED)
+      {
+        Serial.printf("Release confirmed, t=%lu ms\n", now);
+        state = IDLE;
+      }
+    }
+    else
+    {
+      state = PRESSED;
+      stableCounter = 0;
+    }
+    break;
   }
 }
