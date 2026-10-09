@@ -1,129 +1,79 @@
 #include <Arduino.h>
 #include <driver/adc.h>
+#include <esp_adc_cal.h>
 
-// Схема: 3V3 - LDR - GPIO4 (ADC1_CH3) - 10 kOhm - GND
-// Темно: опір LDR росте, напруга на GPIO4 падає, значення ADC менше
-// Світло: опір LDR падає, напруга на GPIO4 росте, значення ADC більше
-// LED: GPIO7 - 220 Ohm - LED - GND
+// Схема: 3V3 - потенціометр 10 kOhm - GND, середній вивід на GPIO4 (ADC1_CH3)
 
 // Pins / ADC
-constexpr uint8_t PIN_LED = 7;
-constexpr adc1_channel_t LDR_CHANNEL = ADC1_CHANNEL_3; // GPIO4 на ESP32-S3
+constexpr adc1_channel_t   POT_CHANNEL = ADC1_CHANNEL_3;   // GPIO4 на ESP32-S3
+constexpr adc_bits_width_t ADC_WIDTH   = ADC_WIDTH_BIT_12; // розрядність 12 біт
+constexpr adc_atten_t      ADC_ATTEN   = ADC_ATTEN_DB_12;  // атенюація 12 dB (колишня 11 dB), діапазон приблизно 0..3100 mV
 
-// SMA
-constexpr uint8_t SMA_WINDOW = 16;
-constexpr uint32_t SAMPLE_MS = 20;
+// Параметри для ручної формули U = RAW * VREF / RAW_MAX
+constexpr uint16_t RAW_MAX      = 4095;    // 2^12 - 1
+constexpr float    VREF_MV      = 3300.0f; // опорна напруга для ручного розрахунку (живлення 3V3)
+constexpr uint32_t DEFAULT_VREF = 1100;    // використовується, лише якщо в eFuse немає калібрування
 
-// Гістерезис у raw-одиницях ADC 0..4095
-constexpr uint16_t TH_DARK = 1400;  // SMA нижче цього: темно, LED ON
-constexpr uint16_t TH_LIGHT = 2200; // SMA вище цього: світло, LED OFF
-static_assert(TH_DARK < TH_LIGHT, "TH_DARK must be below TH_LIGHT");
+constexpr uint32_t SAMPLE_MS    = 100;
+constexpr uint8_t  HEADER_EVERY = 20;      // повторювати заголовок таблиці кожні N рядків
 
-constexpr uint32_t PRINT_MS = 200;
-
-// Simple Moving Average на кільцевому буфері з бігучою сумою
-class SimpleMovingAverage
-{
-public:
-    // Заповнюємо все вікно першим значенням, щоб SMA одразу був валідним
-    void reset(uint16_t value)
-    {
-        for (auto &s : buf_)
-            s = value;
-        sum_ = static_cast<uint32_t>(value) * SMA_WINDOW;
-        idx_ = 0;
-    }
-
-    // Віднімаємо найстаріший семпл, додаємо новий
-    uint16_t update(uint16_t value)
-    {
-        sum_ -= buf_[idx_];
-        buf_[idx_] = value;
-        sum_ += value;
-        idx_ = (idx_ + 1) % SMA_WINDOW;
-        return sum_ / SMA_WINDOW;
-    }
-
-private:
-    uint16_t buf_[SMA_WINDOW] = {};
-    uint32_t sum_ = 0;
-    uint8_t idx_ = 0;
-};
-
-// State
-SimpleMovingAverage sma;
-uint16_t rawValue = 0;
-uint16_t smaValue = 0;
-bool ledOn = false;
+esp_adc_cal_characteristics_t adcChars;
 uint32_t lastSample = 0;
-uint32_t lastPrint = 0;
+uint8_t  rowCount   = 0;
 
-// ADC oneshot
-static void adcInit()
-{
-    adc1_config_width(ADC_WIDTH_BIT_12);                     // 0..4095
-    adc1_config_channel_atten(LDR_CHANNEL, ADC_ATTEN_DB_11); // діапазон приблизно 0..3.1 V
-}
-
-static inline uint16_t adcReadOnce()
-{
-    return static_cast<uint16_t>(adc1_get_raw(LDR_CHANNEL));
-}
-
-static void updateLed(uint16_t avg)
-{
-    if (!ledOn && avg < TH_DARK)
-    {
-        ledOn = true;
-        Serial.printf("[%6lu ms] DARK  (SMA=%u < %u) -> LED ON\n", millis(), avg, TH_DARK);
+static const char* calTypeName(esp_adc_cal_value_t t) {
+    switch (t) {
+        case ESP_ADC_CAL_VAL_EFUSE_VREF:   return "eFuse Vref";
+        case ESP_ADC_CAL_VAL_EFUSE_TP:     return "eFuse Two Point";
+        case ESP_ADC_CAL_VAL_EFUSE_TP_FIT: return "eFuse Two Point + fitting";
+        case ESP_ADC_CAL_VAL_DEFAULT_VREF: return "Default Vref";
+        default:                           return "?";
     }
-    else if (ledOn && avg > TH_LIGHT)
-    {
-        ledOn = false;
-        Serial.printf("[%6lu ms] LIGHT (SMA=%u > %u) -> LED OFF\n", millis(), avg, TH_LIGHT);
-    }
-    // Між TH_DARK і TH_LIGHT стан не змінюється, це прибирає мерехтіння
-    digitalWrite(PIN_LED, ledOn ? HIGH : LOW);
 }
 
-// Setup
-void setup()
-{
+static void printHeader() {
+    Serial.println();
+    Serial.println(" RAW   U_manual(mV)   U_cali(mV)   Error(%)");
+    Serial.println("------------------------------------------");
+}
+
+void setup() {
     Serial.begin(115200);
     delay(300);
 
-    pinMode(PIN_LED, OUTPUT);
-    digitalWrite(PIN_LED, LOW);
+    adc1_config_width(ADC_WIDTH);
+    adc1_config_channel_atten(POT_CHANNEL, ADC_ATTEN);
 
-    adcInit();
-    rawValue = adcReadOnce();
-    sma.reset(rawValue);
-    smaValue = rawValue;
-    updateLed(smaValue);
+    // Калібрування на основі даних, записаних в eFuse на заводі
+    esp_adc_cal_value_t calType =
+        esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN, ADC_WIDTH, DEFAULT_VREF, &adcChars);
 
-    Serial.println("=== LDR + SMA + hysteresis ===");
-    Serial.printf("Window=%u x %lu ms, ON below %u, OFF above %u\n",
-                  SMA_WINDOW, SAMPLE_MS, TH_DARK, TH_LIGHT);
+    Serial.println("=== ADC calibration ===");
+    Serial.println("Channel     : ADC1_CH3 (GPIO4)");
+    Serial.println("Resolution  : 12 bit (0..4095)");
+    Serial.println("Attenuation : 12 dB (approx. 0..3100 mV)");
+    Serial.printf ("Vref manual : %.0f mV\n", VREF_MV);
+    Serial.printf ("Calibration : %s\n", calTypeName(calType));
+    printHeader();
 }
 
-// Superloop
-void loop()
-{
+void loop() {
     const uint32_t now = millis();
+    if (now - lastSample < SAMPLE_MS) return;
+    lastSample = now;
 
-    if (now - lastSample >= SAMPLE_MS)
-    {
-        lastSample = now;
-        rawValue = adcReadOnce();
-        smaValue = sma.update(rawValue);
-        updateLed(smaValue);
+    const int      raw     = adc1_get_raw(POT_CHANNEL);
+    const float    uManual = raw * VREF_MV / RAW_MAX;
+    const uint32_t uCali   = esp_adc_cal_raw_to_voltage(raw, &adcChars);
+
+    // Похибка відносно каліброваного значення, при 0 mV ділити не можна
+    const float errorPct = uCali > 0 ? fabsf(uManual - uCali) / uCali * 100.0f : 0.0f;
+
+    if (rowCount == HEADER_EVERY) {
+        printHeader();
+        rowCount = 0;
     }
+    rowCount++;
 
-    if (now - lastPrint >= PRINT_MS)
-    {
-        lastPrint = now;
-
-        Serial.printf("RAW:%u\tSMA:%u\tTH_DARK:%u\tTH_LIGHT:%u\tLED:%u\n",
-                      rawValue, smaValue, TH_DARK, TH_LIGHT, ledOn ? 1000 : 0);
-    }
+    Serial.printf("%4d   %12.1f   %10lu   %8.2f\n", raw, uManual, uCali, errorPct);
 }
