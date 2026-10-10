@@ -1,176 +1,78 @@
 #include <Arduino.h>
+#include <driver/adc.h>
+#include <esp_adc_cal.h>
 
-// Pins
-constexpr uint8_t PIN_BUZZER = 8;
-constexpr uint8_t PIN_LED = 7;
-constexpr uint8_t PIN_BUTTON = 0;
+// Схема
+// Потенціометр: 3V3 - 10 kOhm - GND, середній вивід на GPIO4 (ADC1_CH3)
+// Сервопривод SG90: сигнал (жовтий/оранжевий) на GPIO9, живлення 5V, GND спільна з ESP32
 
-// PWM
-constexpr uint8_t BUZZER_CH = 0;
-constexpr uint8_t BUZZER_BITS = 10;
+// Pins / ADC
+constexpr adc1_channel_t POT_CHANNEL = ADC1_CHANNEL_3; // GPIO4
+constexpr adc_atten_t ADC_ATTEN = ADC_ATTEN_DB_12;
+constexpr uint8_t PIN_SERVO = 9;
 
-// Часовий тік плеєра
-constexpr uint32_t TICK_MS = 50;
+// Потенціометр: повний оберт 270 градусів між напругами 0 і VCC
+constexpr float POT_RANGE_DEG = 270.0f;
+constexpr float VCC_MV = 3300.0f;
 
-constexpr uint32_t BLINK_MS = 300;
-constexpr uint32_t DEBOUNCE_MS = 50;
+// Сервопривод: 180 градусів між імпульсами SERVO_MIN_US і SERVO_MAX_US
+constexpr float SERVO_RANGE_DEG = 180.0f;
+constexpr uint32_t SERVO_MIN_US = 500;  // 0 градусів
+constexpr uint32_t SERVO_MAX_US = 2500; // 180 градусів, підібрати під свій сервопривод
 
-// Частоти нот 4-ї та 5-ї октави, Hz
-constexpr uint16_t REST = 0;
-constexpr uint16_t NOTE_C4 = 262;
-constexpr uint16_t NOTE_D4 = 294;
-constexpr uint16_t NOTE_E4 = 330;
-constexpr uint16_t NOTE_F4 = 349;
-constexpr uint16_t NOTE_G4 = 392;
-constexpr uint16_t NOTE_A4 = 440;
-constexpr uint16_t NOTE_B4 = 494;
-constexpr uint16_t NOTE_C5 = 523;
+// Пропорція 1:1: поворот потенціометра на 1 градус повертає вал на 1 градус. Діапазони різні, тому використовується лише спільна частина, вирівняна по центру
+constexpr float POT_START_DEG = (POT_RANGE_DEG - SERVO_RANGE_DEG) / 2.0f;
 
-// Нота: частота і тривалість у тіках
-struct Note
+constexpr uint8_t SERVO_CH = 0;
+constexpr uint32_t SERVO_FREQ = 50;
+constexpr uint8_t SERVO_BITS = 14;
+constexpr uint32_t SERVO_PERIOD_US = 1000000 / SERVO_FREQ;
+constexpr uint32_t SERVO_DUTY_MAX = (1u << SERVO_BITS) - 1;
+
+// SMA проти шуму АЦП, щоб вал не тремтів
+constexpr uint8_t SMA_WINDOW = 8;
+constexpr uint32_t UPDATE_MS = 20;
+
+esp_adc_cal_characteristics_t adcChars;
+
+uint32_t smaBuf[SMA_WINDOW] = {};
+uint32_t smaSum = 0;
+uint8_t smaIdx = 0;
+
+uint32_t lastUpdate = 0;
+int loggedAngle = -1;
+
+static uint32_t readPotMv()
 {
-    uint16_t freq;
-    uint8_t ticks;
-};
-
-// Тривалості в тіках по 50 ms
-constexpr uint8_t DUR_4 = 6;  // чверть, 300 ms
-constexpr uint8_t DUR_2 = 12; // половина, 600 ms
-constexpr uint8_t DUR_1 = 24; // ціла, 1200 ms
-
-// Jingle Bells: E E E | E E E | E G C D E
-const Note JINGLE_BELLS[] = {
-    {NOTE_E4, DUR_4},
-    {NOTE_E4, DUR_4},
-    {NOTE_E4, DUR_2},
-    {NOTE_E4, DUR_4},
-    {NOTE_E4, DUR_4},
-    {NOTE_E4, DUR_2},
-    {NOTE_E4, DUR_4},
-    {NOTE_G4, DUR_4},
-    {NOTE_C4, DUR_4},
-    {NOTE_D4, DUR_4},
-    {NOTE_E4, DUR_1},
-    {REST, DUR_2},
-};
-
-// стан змінюється лише в tick(), який викликається раз на TICK_MS
-class BuzzerPlayer
-{
-public:
-    void begin(uint8_t pin, uint8_t channel)
-    {
-        channel_ = channel;
-        ledcSetup(channel_, 1000, BUZZER_BITS);
-        ledcAttachPin(pin, channel_);
-        silence();
-    }
-
-    void play(const Note *melody, size_t length, bool loop)
-    {
-        melody_ = melody;
-        length_ = length;
-        loop_ = loop;
-        index_ = 0;
-        playing_ = true;
-        startNote();
-    }
-
-    void stop()
-    {
-        playing_ = false;
-        silence();
-        Serial.println("Player: stop");
-    }
-
-    bool isPlaying() const { return playing_; }
-
-    void tick()
-    {
-        if (!playing_)
-            return;
-
-        ticksLeft_--;
-
-        // Останній тік ноти беззвучний, щоб однакові ноти підряд не зливались
-        if (ticksLeft_ == 1)
-            silence();
-
-        if (ticksLeft_ > 0)
-            return;
-
-        index_++;
-        if (index_ >= length_)
-        {
-            if (!loop_)
-            {
-                stop();
-                return;
-            }
-            index_ = 0;
-        }
-        startNote();
-    }
-
-private:
-    void startNote()
-    {
-        const Note &n = melody_[index_];
-        ticksLeft_ = n.ticks;
-        if (n.freq == REST)
-        {
-            silence();
-        }
-        else
-        {
-            ledcWriteTone(channel_, n.freq); // 50% заповнення на частоті ноти
-        }
-        Serial.printf("[%6lu ms] note %2u: %3u Hz, %2u ticks\n",
-                      millis(), static_cast<unsigned>(index_), n.freq, n.ticks);
-    }
-
-    void silence() { ledcWrite(channel_, 0); }
-
-    const Note *melody_ = nullptr;
-    size_t length_ = 0;
-    size_t index_ = 0;
-    uint8_t ticksLeft_ = 0;
-    uint8_t channel_ = 0;
-    bool loop_ = false;
-    bool playing_ = false;
-};
-
-BuzzerPlayer player;
-
-uint32_t lastTick = 0;
-uint32_t lastBlink = 0;
-bool ledOn = false;
-
-bool lastButtonRead = HIGH;
-bool buttonState = HIGH;
-uint32_t lastButtonChange = 0;
-
-static void startMelody()
-{
-    Serial.println("Player: Jingle Bells");
-    player.play(JINGLE_BELLS, sizeof(JINGLE_BELLS) / sizeof(JINGLE_BELLS[0]), true);
+    return esp_adc_cal_raw_to_voltage(adc1_get_raw(POT_CHANNEL), &adcChars);
 }
 
-// Повертає true один раз на кожне натискання
-static bool buttonPressed(uint32_t now)
+static uint32_t smaUpdate(uint32_t value)
 {
-    const bool reading = digitalRead(PIN_BUTTON);
-    if (reading != lastButtonRead)
-    {
-        lastButtonRead = reading;
-        lastButtonChange = now;
-    }
-    if (now - lastButtonChange >= DEBOUNCE_MS && reading != buttonState)
-    {
-        buttonState = reading;
-        return buttonState == LOW;
-    }
-    return false;
+    smaSum -= smaBuf[smaIdx];
+    smaBuf[smaIdx] = value;
+    smaSum += value;
+    smaIdx = (smaIdx + 1) % SMA_WINDOW;
+    return smaSum / SMA_WINDOW;
+}
+
+// Кут потенціометра від його крайнього лівого положення
+static float potAngleFromMv(uint32_t mv)
+{
+    return mv / VCC_MV * POT_RANGE_DEG;
+}
+
+// Кут серво від крайнього лівого положення, з обрізанням до спільного діапазону
+static float servoAngleFromPot(float potDeg)
+{
+    return constrain(potDeg - POT_START_DEG, 0.0f, SERVO_RANGE_DEG);
+}
+
+static void servoWrite(float angleDeg)
+{
+    const float us = SERVO_MIN_US + angleDeg / SERVO_RANGE_DEG * (SERVO_MAX_US - SERVO_MIN_US);
+    const uint32_t duty = static_cast<uint32_t>(us / SERVO_PERIOD_US * SERVO_DUTY_MAX + 0.5f);
+    ledcWrite(SERVO_CH, duty);
 }
 
 void setup()
@@ -178,42 +80,46 @@ void setup()
     Serial.begin(115200);
     delay(300);
 
-    pinMode(PIN_LED, OUTPUT);
-    pinMode(PIN_BUTTON, INPUT_PULLUP);
+    adc1_config_width(ADC_WIDTH_BIT_12);
+    adc1_config_channel_atten(POT_CHANNEL, ADC_ATTEN);
+    esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN, ADC_WIDTH_BIT_12, 1100, &adcChars);
 
-    player.begin(PIN_BUZZER, BUZZER_CH);
+    // Заповнюємо вікно SMA першим значенням, щоб серво не смикнувся на старті
+    const uint32_t mv = readPotMv();
+    for (auto &s : smaBuf)
+        s = mv;
+    smaSum = mv * SMA_WINDOW;
 
-    Serial.println("=== Non-blocking buzzer player ===");
-    Serial.printf("Tick: %lu ms, BOOT button: play / stop\n", TICK_MS);
+    ledcSetup(SERVO_CH, SERVO_FREQ, SERVO_BITS);
+    ledcAttachPin(PIN_SERVO, SERVO_CH);
+    servoWrite(servoAngleFromPot(potAngleFromMv(mv)));
 
-    lastTick = millis();
-    startMelody();
+    Serial.println("=== Servo 1:1 ===");
+    Serial.printf("Pot %.0f deg, servo %.0f deg, used pot range %.0f..%.0f deg\n",
+                  POT_RANGE_DEG, SERVO_RANGE_DEG, POT_START_DEG, POT_START_DEG + SERVO_RANGE_DEG);
 }
 
 void loop()
 {
     const uint32_t now = millis();
+    if (now - lastUpdate < UPDATE_MS)
+        return;
+    lastUpdate = now;
 
-    // Фіксований тік: += TICK_MS замість = now, щоб похибка не накопичувалась
-    if (now - lastTick >= TICK_MS)
-    {
-        lastTick += TICK_MS;
-        player.tick();
-    }
+    const uint32_t mv = smaUpdate(readPotMv());
+    const float potDeg = potAngleFromMv(mv);
+    const float servoDeg = servoAngleFromPot(potDeg);
+    servoWrite(servoDeg);
 
-    // Ця робота виконується паралельно з мелодією
-    if (now - lastBlink >= BLINK_MS)
+    // Логуємо лише зміну кута хоча б на 1 градус, щоб не засмічувати консоль
+    const int angle = static_cast<int>(servoDeg + 0.5f);
+    if (angle != loggedAngle)
     {
-        lastBlink = now;
-        ledOn = !ledOn;
-        digitalWrite(PIN_LED, ledOn ? HIGH : LOW);
-    }
-
-    if (buttonPressed(now))
-    {
-        if (player.isPlaying())
-            player.stop();
-        else
-            startMelody();
+        loggedAngle = angle;
+        const char *clip = potDeg < POT_START_DEG                     ? "  (clipped: left)"
+                           : potDeg > POT_START_DEG + SERVO_RANGE_DEG ? "  (clipped: right)"
+                                                                      : "";
+        Serial.printf("U=%4lu mV  pot=%5.1f deg  servo=%3d deg from left%s\n",
+                      mv, potDeg, angle, clip);
     }
 }
