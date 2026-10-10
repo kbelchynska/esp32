@@ -1,58 +1,176 @@
 #include <Arduino.h>
-#include <driver/adc.h>
 
-// Pins / ADC
-constexpr adc1_channel_t POT_LED_CHANNEL = ADC1_CHANNEL_3;   // GPIO4
-constexpr adc1_channel_t POT_MOTOR_CHANNEL = ADC1_CHANNEL_4; // GPIO5
+// Pins
+constexpr uint8_t PIN_BUZZER = 8;
 constexpr uint8_t PIN_LED = 7;
-constexpr uint8_t PIN_MOTOR = 6;
-
-constexpr uint16_t ADC_MAX = 4095;
-constexpr uint8_t OVERSAMPLE = 8; // усереднення кількох зчитувань проти шуму
+constexpr uint8_t PIN_BUTTON = 0;
 
 // PWM
-// Канал n використовує таймер n / 2, тому канали 0 і 2 мають окремі таймери і частоту одного каналу можна змінювати, не зачіпаючи інший
-constexpr uint8_t LED_CH = 0;
-constexpr uint32_t LED_FREQ = 5000; // 5 kHz, мерехтіння оку не видно
-constexpr uint8_t MOTOR_CH = 2;
-constexpr uint32_t MOTOR_FREQ = 20000; // 20 kHz, вище чутного діапазону, мотор не пищить
-constexpr uint8_t PWM_BITS = 10;
-constexpr uint32_t PWM_MAX = (1u << PWM_BITS) - 1; // 1023
+constexpr uint8_t BUZZER_CH = 0;
+constexpr uint8_t BUZZER_BITS = 10;
 
-// Мотор не рушає з місця при малому заповненні, тому нижче DEADZONE мотор вимкнений, вище duty починається з MOTOR_MIN_DUTY
-constexpr uint16_t MOTOR_DEADZONE = 100; // у raw-одиницях ADC
-constexpr uint32_t MOTOR_MIN_DUTY = 350; // підібрати під свій мотор
+// Часовий тік плеєра
+constexpr uint32_t TICK_MS = 50;
 
-constexpr uint32_t UPDATE_MS = 20;
-constexpr uint32_t PRINT_MS = 200;
+constexpr uint32_t BLINK_MS = 300;
+constexpr uint32_t DEBOUNCE_MS = 50;
 
-uint32_t ledDuty = 0;
-uint32_t motorDuty = 0;
-uint16_t ledRaw = 0;
-uint16_t motorRaw = 0;
-uint32_t lastUpdate = 0;
-uint32_t lastPrint = 0;
+// Частоти нот 4-ї та 5-ї октави, Hz
+constexpr uint16_t REST = 0;
+constexpr uint16_t NOTE_C4 = 262;
+constexpr uint16_t NOTE_D4 = 294;
+constexpr uint16_t NOTE_E4 = 330;
+constexpr uint16_t NOTE_F4 = 349;
+constexpr uint16_t NOTE_G4 = 392;
+constexpr uint16_t NOTE_A4 = 440;
+constexpr uint16_t NOTE_B4 = 494;
+constexpr uint16_t NOTE_C5 = 523;
 
-static uint16_t readPot(adc1_channel_t ch)
+// Нота: частота і тривалість у тіках
+struct Note
 {
-    uint32_t sum = 0;
-    for (uint8_t i = 0; i < OVERSAMPLE; i++)
-        sum += adc1_get_raw(ch);
-    return sum / OVERSAMPLE;
+    uint16_t freq;
+    uint8_t ticks;
+};
+
+// Тривалості в тіках по 50 ms
+constexpr uint8_t DUR_4 = 6;  // чверть, 300 ms
+constexpr uint8_t DUR_2 = 12; // половина, 600 ms
+constexpr uint8_t DUR_1 = 24; // ціла, 1200 ms
+
+// Jingle Bells: E E E | E E E | E G C D E
+const Note JINGLE_BELLS[] = {
+    {NOTE_E4, DUR_4},
+    {NOTE_E4, DUR_4},
+    {NOTE_E4, DUR_2},
+    {NOTE_E4, DUR_4},
+    {NOTE_E4, DUR_4},
+    {NOTE_E4, DUR_2},
+    {NOTE_E4, DUR_4},
+    {NOTE_G4, DUR_4},
+    {NOTE_C4, DUR_4},
+    {NOTE_D4, DUR_4},
+    {NOTE_E4, DUR_1},
+    {REST, DUR_2},
+};
+
+// стан змінюється лише в tick(), який викликається раз на TICK_MS
+class BuzzerPlayer
+{
+public:
+    void begin(uint8_t pin, uint8_t channel)
+    {
+        channel_ = channel;
+        ledcSetup(channel_, 1000, BUZZER_BITS);
+        ledcAttachPin(pin, channel_);
+        silence();
+    }
+
+    void play(const Note *melody, size_t length, bool loop)
+    {
+        melody_ = melody;
+        length_ = length;
+        loop_ = loop;
+        index_ = 0;
+        playing_ = true;
+        startNote();
+    }
+
+    void stop()
+    {
+        playing_ = false;
+        silence();
+        Serial.println("Player: stop");
+    }
+
+    bool isPlaying() const { return playing_; }
+
+    void tick()
+    {
+        if (!playing_)
+            return;
+
+        ticksLeft_--;
+
+        // Останній тік ноти беззвучний, щоб однакові ноти підряд не зливались
+        if (ticksLeft_ == 1)
+            silence();
+
+        if (ticksLeft_ > 0)
+            return;
+
+        index_++;
+        if (index_ >= length_)
+        {
+            if (!loop_)
+            {
+                stop();
+                return;
+            }
+            index_ = 0;
+        }
+        startNote();
+    }
+
+private:
+    void startNote()
+    {
+        const Note &n = melody_[index_];
+        ticksLeft_ = n.ticks;
+        if (n.freq == REST)
+        {
+            silence();
+        }
+        else
+        {
+            ledcWriteTone(channel_, n.freq); // 50% заповнення на частоті ноти
+        }
+        Serial.printf("[%6lu ms] note %2u: %3u Hz, %2u ticks\n",
+                      millis(), static_cast<unsigned>(index_), n.freq, n.ticks);
+    }
+
+    void silence() { ledcWrite(channel_, 0); }
+
+    const Note *melody_ = nullptr;
+    size_t length_ = 0;
+    size_t index_ = 0;
+    uint8_t ticksLeft_ = 0;
+    uint8_t channel_ = 0;
+    bool loop_ = false;
+    bool playing_ = false;
+};
+
+BuzzerPlayer player;
+
+uint32_t lastTick = 0;
+uint32_t lastBlink = 0;
+bool ledOn = false;
+
+bool lastButtonRead = HIGH;
+bool buttonState = HIGH;
+uint32_t lastButtonChange = 0;
+
+static void startMelody()
+{
+    Serial.println("Player: Jingle Bells");
+    player.play(JINGLE_BELLS, sizeof(JINGLE_BELLS) / sizeof(JINGLE_BELLS[0]), true);
 }
 
-static uint32_t ledDutyFromRaw(uint16_t raw)
+// Повертає true один раз на кожне натискання
+static bool buttonPressed(uint32_t now)
 {
-
-    const float x = static_cast<float>(raw) / ADC_MAX;
-    return static_cast<uint32_t>(x * x * PWM_MAX + 0.5f);
-}
-
-static uint32_t motorDutyFromRaw(uint16_t raw)
-{
-    if (raw < MOTOR_DEADZONE)
-        return 0;
-    return map(raw, MOTOR_DEADZONE, ADC_MAX, MOTOR_MIN_DUTY, PWM_MAX);
+    const bool reading = digitalRead(PIN_BUTTON);
+    if (reading != lastButtonRead)
+    {
+        lastButtonRead = reading;
+        lastButtonChange = now;
+    }
+    if (now - lastButtonChange >= DEBOUNCE_MS && reading != buttonState)
+    {
+        buttonState = reading;
+        return buttonState == LOW;
+    }
+    return false;
 }
 
 void setup()
@@ -60,46 +178,42 @@ void setup()
     Serial.begin(115200);
     delay(300);
 
-    adc1_config_width(ADC_WIDTH_BIT_12);
-    adc1_config_channel_atten(POT_LED_CHANNEL, ADC_ATTEN_DB_12);
-    adc1_config_channel_atten(POT_MOTOR_CHANNEL, ADC_ATTEN_DB_12);
+    pinMode(PIN_LED, OUTPUT);
+    pinMode(PIN_BUTTON, INPUT_PULLUP);
 
-    ledcSetup(LED_CH, LED_FREQ, PWM_BITS);
-    ledcAttachPin(PIN_LED, LED_CH);
-    ledcWrite(LED_CH, 0);
+    player.begin(PIN_BUZZER, BUZZER_CH);
 
-    ledcSetup(MOTOR_CH, MOTOR_FREQ, PWM_BITS);
-    ledcAttachPin(PIN_MOTOR, MOTOR_CH);
-    ledcWrite(MOTOR_CH, 0);
+    Serial.println("=== Non-blocking buzzer player ===");
+    Serial.printf("Tick: %lu ms, BOOT button: play / stop\n", TICK_MS);
 
-    Serial.println("=== PWM: LED + motor ===");
-    Serial.printf("LED   : GPIO%u, ch %u, %lu Hz, %u bit\n", PIN_LED, LED_CH, LED_FREQ, PWM_BITS);
-    Serial.printf("Motor : GPIO%u, ch %u, %lu Hz, %u bit\n", PIN_MOTOR, MOTOR_CH, MOTOR_FREQ, PWM_BITS);
+    lastTick = millis();
+    startMelody();
 }
 
 void loop()
 {
     const uint32_t now = millis();
 
-    // Кожен потенціометр керує лише своїм каналом
-    if (now - lastUpdate >= UPDATE_MS)
+    // Фіксований тік: += TICK_MS замість = now, щоб похибка не накопичувалась
+    if (now - lastTick >= TICK_MS)
     {
-        lastUpdate = now;
-
-        ledRaw = readPot(POT_LED_CHANNEL);
-        ledDuty = ledDutyFromRaw(ledRaw);
-        ledcWrite(LED_CH, ledDuty);
-
-        motorRaw = readPot(POT_MOTOR_CHANNEL);
-        motorDuty = motorDutyFromRaw(motorRaw);
-        ledcWrite(MOTOR_CH, motorDuty);
+        lastTick += TICK_MS;
+        player.tick();
     }
 
-    if (now - lastPrint >= PRINT_MS)
+    // Ця робота виконується паралельно з мелодією
+    if (now - lastBlink >= BLINK_MS)
     {
-        lastPrint = now;
-        Serial.printf("LED raw:%4u duty:%4lu (%3lu%%)   MOTOR raw:%4u duty:%4lu (%3lu%%)\n",
-                      ledRaw, ledDuty, ledDuty * 100 / PWM_MAX,
-                      motorRaw, motorDuty, motorDuty * 100 / PWM_MAX);
+        lastBlink = now;
+        ledOn = !ledOn;
+        digitalWrite(PIN_LED, ledOn ? HIGH : LOW);
+    }
+
+    if (buttonPressed(now))
+    {
+        if (player.isPlaying())
+            player.stop();
+        else
+            startMelody();
     }
 }
